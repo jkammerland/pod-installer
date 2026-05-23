@@ -1,0 +1,528 @@
+#include "podman_manager/podman_manager.hpp"
+
+#include <arpa/inet.h>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <map>
+#include <netinet/in.h>
+#include <optional>
+#include <poll.h>
+#include <sstream>
+#include <string>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <vector>
+
+namespace pm = podman_manager;
+
+namespace
+{
+volatile std::sig_atomic_t g_stop = 0;
+
+void handle_signal(int)
+{
+    g_stop = 1;
+}
+
+struct Config
+{
+    std::string host{"127.0.0.1"};
+    uint16_t port{9090};
+    std::string api_version{"5.0.0"};
+    bool dry_run{true};
+    bool apply_systemd{false};
+    bool validate_socket{true};
+};
+
+struct HttpRequestLine
+{
+    std::string method;
+    std::string target;
+};
+
+struct Query
+{
+    std::string path;
+    std::map<std::string, std::vector<std::string>> params;
+
+    std::optional<std::string> one(std::string_view key) const
+    {
+        const auto it = params.find(std::string{key});
+        if (it == params.end() || it->second.empty())
+        {
+            return std::nullopt;
+        }
+        return it->second.front();
+    }
+
+    std::vector<std::string> many(std::string_view key) const
+    {
+        const auto it = params.find(std::string{key});
+        if (it == params.end())
+        {
+            return {};
+        }
+        return it->second;
+    }
+};
+
+void usage(const char* argv0)
+{
+    std::cerr << "usage: " << argv0
+              << " [--listen 127.0.0.1:9090] [--api-version 5.0.0]"
+                 " [--execute] [--apply-systemd] [--no-socket-validation]\n";
+}
+
+pm::Result<Config> parse_args(int argc, char** argv)
+{
+    Config config;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string arg = argv[i];
+        if (arg == "--help")
+        {
+            usage(argv[0]);
+            std::exit(0);
+        }
+        if (arg == "--execute")
+        {
+            config.dry_run = false;
+            continue;
+        }
+        if (arg == "--apply-systemd")
+        {
+            config.apply_systemd = true;
+            continue;
+        }
+        if (arg == "--no-socket-validation")
+        {
+            config.validate_socket = false;
+            continue;
+        }
+        if ((arg == "--listen" || arg == "--api-version") && i + 1 >= argc)
+        {
+            return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
+                                                  arg + " requires a value"));
+        }
+        if (arg == "--listen")
+        {
+            const std::string value = argv[++i];
+            const auto colon = value.rfind(':');
+            if (colon == std::string::npos)
+            {
+                return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
+                                                      "--listen must be HOST:PORT"));
+            }
+            config.host = value.substr(0, colon);
+            const auto port_value = std::stoul(value.substr(colon + 1));
+            if (port_value == 0 || port_value > 65535)
+            {
+                return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
+                                                      "listen port is out of range"));
+            }
+            config.port = static_cast<uint16_t>(port_value);
+            continue;
+        }
+        if (arg == "--api-version")
+        {
+            config.api_version = argv[++i];
+            continue;
+        }
+        return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
+                                              "unknown argument: " + arg));
+    }
+    return config;
+}
+
+pm::Result<HttpRequestLine> parse_request_line(std::string_view request)
+{
+    const auto end = request.find("\r\n");
+    if (end == std::string_view::npos)
+    {
+        return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
+                                              "request line is missing CRLF"));
+    }
+
+    std::istringstream in{std::string{request.substr(0, end)}};
+    HttpRequestLine line;
+    std::string version;
+    in >> line.method >> line.target >> version;
+    if (line.method.empty() || line.target.empty() || version.rfind("HTTP/", 0) != 0)
+    {
+        return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
+                                              "malformed HTTP request line"));
+    }
+    return line;
+}
+
+pm::Result<Query> parse_query(std::string_view target)
+{
+    Query query;
+    const auto question = target.find('?');
+    query.path = std::string{target.substr(0, question)};
+    if (question == std::string_view::npos)
+    {
+        return query;
+    }
+
+    std::string_view remaining = target.substr(question + 1);
+    while (!remaining.empty())
+    {
+        const auto amp = remaining.find('&');
+        const auto part = remaining.substr(0, amp);
+        const auto eq = part.find('=');
+        const auto raw_key = part.substr(0, eq);
+        const auto raw_value = eq == std::string_view::npos ? std::string_view{} : part.substr(eq + 1);
+
+        auto key = pm::url_decode_component(raw_key, true);
+        auto value = pm::url_decode_component(raw_value, true);
+        if (!key)
+        {
+            return std::unexpected(key.error());
+        }
+        if (!value)
+        {
+            return std::unexpected(value.error());
+        }
+        query.params[*key].push_back(*value);
+
+        if (amp == std::string_view::npos)
+        {
+            break;
+        }
+        remaining.remove_prefix(amp + 1);
+    }
+    return query;
+}
+
+std::string json_escape(std::string_view value)
+{
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (const unsigned char c : value)
+    {
+        if (c == '"' || c == '\\')
+        {
+            out.push_back('\\');
+            out.push_back(static_cast<char>(c));
+        }
+        else if (c == '\n')
+        {
+            out += "\\n";
+        }
+        else if (c == '\r')
+        {
+            out += "\\r";
+        }
+        else if (c == '\t')
+        {
+            out += "\\t";
+        }
+        else
+        {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+std::string response(int status, std::string_view body, std::string_view content_type = "application/json")
+{
+    const char* reason = "OK";
+    if (status == 202)
+    {
+        reason = "Accepted";
+    }
+    else if (status == 400)
+    {
+        reason = "Bad Request";
+    }
+    else if (status == 404)
+    {
+        reason = "Not Found";
+    }
+    else if (status == 500)
+    {
+        reason = "Internal Server Error";
+    }
+
+    std::ostringstream out;
+    out << "HTTP/1.1 " << status << ' ' << reason << "\r\n";
+    out << "Content-Type: " << content_type << "\r\n";
+    out << "Content-Length: " << body.size() << "\r\n";
+    out << "Connection: close\r\n\r\n";
+    out << body;
+    return out.str();
+}
+
+std::optional<uint64_t> parse_u64(const std::optional<std::string>& value)
+{
+    if (!value)
+    {
+        return std::nullopt;
+    }
+    return std::stoull(*value);
+}
+
+pm::Result<pm::UserSlicePolicy> user_slice_from_query(uid_t uid, const Query& query)
+{
+    pm::UserSlicePolicy policy;
+    policy.uid = uid;
+    policy.cpu_quota = query.one("cpuQuota");
+    policy.memory_max = query.one("memoryMax");
+    policy.allowed_cpus = query.one("allowedCpus");
+    try
+    {
+        policy.cpu_weight = parse_u64(query.one("cpuWeight"));
+        policy.tasks_max = parse_u64(query.one("tasksMax"));
+    }
+    catch (const std::exception& ex)
+    {
+        return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
+                                              std::string{"invalid numeric slice policy: "} + ex.what()));
+    }
+    return policy;
+}
+
+pm::Result<std::string> handle_deploy(const Config& config, const Query& query)
+{
+    const auto user = query.one("user");
+    const auto name = query.one("name");
+    const auto image = query.one("image");
+    if (!user || !name || !image)
+    {
+        return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
+                                              "deploy requires user, name, and image query parameters"));
+    }
+
+    auto target = pm::resolve_user(*user, {}, config.api_version);
+    if (!target)
+    {
+        return std::unexpected(target.error());
+    }
+
+    pm::ContainerSpec spec;
+    spec.name = *name;
+    spec.image = *image;
+    spec.command = query.many("arg");
+    if (const auto command = query.one("cmd"))
+    {
+        spec.command.insert(spec.command.begin(), *command);
+    }
+    spec.labels = {
+        {"com.example.podman-manager.managed", "true"},
+        {"com.example.podman-manager.target-user", target->user_name},
+    };
+
+    auto spec_json = pm::to_podman_create_json(spec);
+    if (!spec_json)
+    {
+        return std::unexpected(spec_json.error());
+    }
+
+    const bool has_slice_policy = query.one("cpuQuota") || query.one("cpuWeight") || query.one("memoryMax") ||
+                                  query.one("tasksMax") || query.one("allowedCpus");
+    if (has_slice_policy)
+    {
+        auto policy = user_slice_from_query(target->uid, query);
+        if (!policy)
+        {
+            return std::unexpected(policy.error());
+        }
+        if (config.apply_systemd && !config.dry_run)
+        {
+            pm::SystemctlSliceController controller;
+            if (auto applied = controller.apply(*policy); !applied)
+            {
+                return std::unexpected(applied.error());
+            }
+        }
+    }
+
+    if (config.dry_run)
+    {
+        return std::string{"{\"dryRun\":true,\"targetSocket\":"} + json_escape(target->socket_path.string()) +
+               ",\"createSpec\":" + *spec_json + "}\n";
+    }
+
+    if (config.validate_socket)
+    {
+        if (auto socket = pm::validate_podman_socket(*target); !socket)
+        {
+            return std::unexpected(socket.error());
+        }
+    }
+
+    pm::PodmanClient client{*target};
+    if (auto ping = client.ping(); !ping)
+    {
+        return std::unexpected(ping.error());
+    }
+    auto created = client.create_container(spec);
+    if (!created)
+    {
+        return std::unexpected(created.error());
+    }
+
+    const bool start = query.one("start").value_or("true") != "false";
+    if (start)
+    {
+        auto started = client.start_container(spec.name);
+        if (!started)
+        {
+            return std::unexpected(started.error());
+        }
+    }
+
+    return std::string{"{\"dryRun\":false,\"container\":"} + json_escape(spec.name) + ",\"started\":" +
+           (start ? "true" : "false") + "}\n";
+}
+
+std::string handle_request(const Config& config, std::string_view raw)
+{
+    auto line = parse_request_line(raw);
+    if (!line)
+    {
+        return response(400, "{\"error\":" + json_escape(line.error().message) + "}\n");
+    }
+
+    auto query = parse_query(line->target);
+    if (!query)
+    {
+        return response(400, "{\"error\":" + json_escape(query.error().message) + "}\n");
+    }
+
+    if (line->method == "GET" && query->path == "/healthz")
+    {
+        return response(200, "{\"status\":\"ok\"}\n");
+    }
+
+    if (line->method == "POST" && query->path == "/v1/deploy")
+    {
+        auto result = handle_deploy(config, *query);
+        if (!result)
+        {
+            return response(400, "{\"error\":" + json_escape(result.error().message) + "}\n");
+        }
+        return response(config.dry_run ? 200 : 202, *result);
+    }
+
+    return response(404, "{\"error\":\"not found\"}\n");
+}
+
+int create_listener(const Config& config)
+{
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        throw std::runtime_error(std::string{"socket failed: "} + std::strerror(errno));
+    }
+
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(config.port);
+    if (inet_pton(AF_INET, config.host.c_str(), &addr.sin_addr) != 1)
+    {
+        close(fd);
+        throw std::runtime_error("listen host must be an IPv4 address");
+    }
+
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+    {
+        const auto message = std::string{"bind failed: "} + std::strerror(errno);
+        close(fd);
+        throw std::runtime_error(message);
+    }
+    if (listen(fd, 32) != 0)
+    {
+        const auto message = std::string{"listen failed: "} + std::strerror(errno);
+        close(fd);
+        throw std::runtime_error(message);
+    }
+
+    return fd;
+}
+}
+
+int main(int argc, char** argv)
+{
+    auto config = parse_args(argc, argv);
+    if (!config)
+    {
+        std::cerr << config.error().message << '\n';
+        usage(argv[0]);
+        return 2;
+    }
+
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
+
+    int listener{};
+    try
+    {
+        listener = create_listener(*config);
+    }
+    catch (const std::exception& ex)
+    {
+        std::cerr << ex.what() << '\n';
+        return 1;
+    }
+
+    std::cerr << "podman-manager example listening on " << config->host << ':' << config->port
+              << (config->dry_run ? " in dry-run mode" : " in execute mode") << '\n';
+
+    while (!g_stop)
+    {
+        pollfd ready{};
+        ready.fd = listener;
+        ready.events = POLLIN;
+        const int poll_rc = poll(&ready, 1, 250);
+        if (poll_rc < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            std::cerr << "poll failed: " << std::strerror(errno) << '\n';
+            break;
+        }
+        if (poll_rc == 0)
+        {
+            continue;
+        }
+
+        sockaddr_in peer{};
+        socklen_t peer_len = sizeof(peer);
+        const int client = accept(listener, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        if (client < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            std::cerr << "accept failed: " << std::strerror(errno) << '\n';
+            break;
+        }
+
+        std::string raw;
+        char buffer[4096];
+        const ssize_t n = recv(client, buffer, sizeof(buffer), 0);
+        if (n > 0)
+        {
+            raw.assign(buffer, static_cast<size_t>(n));
+            const auto out = handle_request(*config, raw);
+            send(client, out.data(), out.size(), MSG_NOSIGNAL);
+        }
+        close(client);
+    }
+
+    close(listener);
+    return 0;
+}

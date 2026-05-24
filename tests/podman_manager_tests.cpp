@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <sstream>
@@ -19,6 +20,59 @@ namespace pm = podman_manager;
 
 namespace
 {
+std::string valid_quadlet_contents()
+{
+    return "[Unit]\n"
+           "Description=Demo\n"
+           "\n"
+           "[Container]\n"
+           "Image=localhost/demo:latest\n"
+           "Label=com.example.podman-manager.managed=true\n"
+           "ReadOnly=true\n"
+           "\n"
+           "[Service]\n"
+           "Restart=on-failure\n";
+}
+
+class FakeSystemdController final : public pm::UserSystemdController
+{
+public:
+    mutable std::vector<std::string> calls;
+
+    pm::Result<void> daemon_reload(const pm::PodmanTarget&) const override
+    {
+        calls.push_back("daemon-reload");
+        return {};
+    }
+
+    pm::Result<std::string> start_unit(const pm::PodmanTarget&, std::string_view unit) const override
+    {
+        calls.push_back("start " + std::string{unit});
+        return "/org/freedesktop/systemd1/job/start";
+    }
+
+    pm::Result<std::string> restart_unit(const pm::PodmanTarget&, std::string_view unit) const override
+    {
+        calls.push_back("restart " + std::string{unit});
+        return "/org/freedesktop/systemd1/job/restart";
+    }
+
+    pm::Result<std::string> stop_unit(const pm::PodmanTarget&, std::string_view unit) const override
+    {
+        calls.push_back("stop " + std::string{unit});
+        return "/org/freedesktop/systemd1/job/stop";
+    }
+
+    pm::Result<pm::UnitStatus> status(const pm::PodmanTarget&, std::string_view unit) const override
+    {
+        calls.push_back("status " + std::string{unit});
+        return pm::UnitStatus{.unit = std::string{unit},
+                              .load_state = "loaded",
+                              .active_state = "active",
+                              .sub_state = "running"};
+    }
+};
+
 class TempDir
 {
 public:
@@ -196,7 +250,7 @@ void test_socket_validation()
     assert(!pm::validate_podman_socket(target, options));
 }
 
-void test_systemd_args_and_quadlet()
+void test_systemd_args()
 {
     pm::UserSlicePolicy policy{.uid = 1000,
                                .cpu_quota = "200%",
@@ -211,30 +265,97 @@ void test_systemd_args_and_quadlet()
     assert((*args)[3] == "user-1000.slice");
     assert(std::ranges::find(*args, "AllowedCPUs=2-3") != args->end());
 
-    pm::ContainerSpec spec;
-    spec.name = "demo";
-    spec.image = "localhost/demo:latest";
-    spec.command = {"/usr/bin/demo"};
-    spec.labels = {{"com.example.managed", "true"}};
-    auto quadlet = pm::render_quadlet_container(pm::QuadletContainer{.description = "Demo container",
-                                                                     .container = spec,
-                                                                     .service_policy = policy});
-    assert(quadlet);
-    assert(quadlet->find("[Container]\n") != std::string::npos);
-    assert(quadlet->find("ContainerName=demo\n") != std::string::npos);
-    assert(quadlet->find("CPUQuota=200%\n") != std::string::npos);
+    pm::PodmanTarget target;
+    target.uid = 1000;
+    target.user_name = "alice";
+    auto user_args = pm::build_systemctl_user_args(target, "restart", "demo.service");
+    assert(user_args);
+    assert((*user_args)[0] == "systemctl");
+    assert((*user_args)[1] == "--user");
+    assert((*user_args)[2] == "--machine=alice@.host");
+    assert((*user_args)[3] == "restart");
+    assert((*user_args)[4] == "demo.service");
+    assert(!pm::build_systemctl_user_args(target, "restart", "../bad.service"));
+}
 
-    spec.env = {{"BAD", "line\nbreak"}};
-    pm::QuadletContainer bad_unit;
-    bad_unit.description = "Bad";
-    bad_unit.container = spec;
-    auto bad_quadlet = pm::render_quadlet_container(bad_unit);
-    assert(!bad_quadlet);
+void test_quadlet_policy_and_install()
+{
+    pm::QuadletFile quadlet;
+    quadlet.file_name = "demo.container";
+    quadlet.contents = valid_quadlet_contents();
 
-    spec.env.clear();
-    spec.command = {"/usr/bin/demo", "line\nbreak"};
-    bad_unit.container = spec;
-    assert(!pm::render_quadlet_container(bad_unit));
+    assert(pm::validate_quadlet_file_name(quadlet.file_name));
+    auto unit = pm::service_unit_name_from_quadlet(quadlet.file_name);
+    assert(unit);
+    assert(*unit == "demo.service");
+    assert(pm::validate_quadlet_policy(quadlet));
+
+    pm::QuadletFile bad = quadlet;
+    bad.file_name = "../demo.container";
+    assert(!pm::validate_quadlet_policy(bad));
+
+    bad = quadlet;
+    bad.contents = "[Container]\nImage=busybox\nPrivileged=true\n"
+                   "Label=com.example.podman-manager.managed=true\n";
+    auto privileged = pm::validate_quadlet_policy(bad);
+    assert(!privileged);
+    assert(privileged.error().kind == pm::ErrorKind::policy);
+
+    bad = quadlet;
+    bad.contents = "[Container]\nImage=busybox\nNetwork=host\n"
+                   "Label=com.example.podman-manager.managed=true\n";
+    assert(!pm::validate_quadlet_policy(bad));
+
+    bad = quadlet;
+    bad.contents = "[Container]\nImage=busybox\n";
+    assert(!pm::validate_quadlet_policy(bad));
+
+    TempDir temp;
+    pm::QuadletInstallLayout layout;
+    layout.admin_user_root = temp.path();
+    pm::QuadletInstaller installer{layout};
+    auto installed = installer.install_for_user(getuid(), quadlet);
+    assert(installed);
+    assert(installed->systemd_unit == "demo.service");
+    assert(std::filesystem::exists(installed->path));
+
+    std::ifstream in{installed->path};
+    std::stringstream contents;
+    contents << in.rdbuf();
+    assert(contents.str() == quadlet.contents);
+}
+
+void test_deployment_orchestrator_installs_and_restarts()
+{
+    TempDir temp;
+
+    pm::QuadletInstallLayout layout;
+    layout.admin_user_root = temp.path();
+
+    pm::DeploymentBundle bundle;
+    bundle.target_uid = getuid();
+    bundle.service_name = "demo";
+    bundle.revision = "42";
+    bundle.quadlet.file_name = "demo.container";
+    bundle.quadlet.contents = valid_quadlet_contents();
+
+    FakeSystemdController systemd;
+    pm::DeploymentOptions options;
+    options.validate_socket = false;
+    options.load_image_archive = false;
+    options.dry_run = false;
+
+    pm::DeploymentOrchestrator orchestrator{pm::QuadletInstaller{layout}, systemd, options};
+    auto deployed = orchestrator.deploy(bundle);
+    assert(deployed);
+    assert(deployed->installed_quadlet_path == temp.path() / std::to_string(getuid()) / "demo.container");
+    assert(deployed->systemd_unit == "demo.service");
+    assert(deployed->job_path == "/org/freedesktop/systemd1/job/restart");
+    assert(deployed->status);
+    assert(systemd.calls.size() == 3);
+    assert(systemd.calls[0] == "daemon-reload");
+    assert(systemd.calls[1] == "restart demo.service");
+    assert(systemd.calls[2] == "status demo.service");
 }
 
 void test_podman_client_against_fake_unix_server()
@@ -299,7 +420,9 @@ int main()
     test_container_spec_validation_edges();
     test_url_codec();
     test_socket_validation();
-    test_systemd_args_and_quadlet();
+    test_systemd_args();
+    test_quadlet_policy_and_install();
+    test_deployment_orchestrator_installs_and_restarts();
     test_podman_client_against_fake_unix_server();
 
     std::cout << "podman_manager_tests passed\n";

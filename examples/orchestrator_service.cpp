@@ -4,6 +4,8 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <netinet/in.h>
@@ -32,7 +34,6 @@ struct Config
     uint16_t port{9090};
     std::string api_version{"5.0.0"};
     bool dry_run{true};
-    bool apply_systemd{false};
     bool validate_socket{true};
 };
 
@@ -72,7 +73,7 @@ void usage(const char* argv0)
 {
     std::cerr << "usage: " << argv0
               << " [--listen 127.0.0.1:9090] [--api-version 5.0.0]"
-                 " [--execute] [--apply-systemd] [--no-socket-validation]\n";
+                 " [--execute] [--no-socket-validation]\n";
 }
 
 pm::Result<Config> parse_args(int argc, char** argv)
@@ -89,11 +90,6 @@ pm::Result<Config> parse_args(int argc, char** argv)
         if (arg == "--execute")
         {
             config.dry_run = false;
-            continue;
-        }
-        if (arg == "--apply-systemd")
-        {
-            config.apply_systemd = true;
             continue;
         }
         if (arg == "--no-socket-validation")
@@ -259,44 +255,45 @@ std::string response(int status, std::string_view body, std::string_view content
     return out.str();
 }
 
-std::optional<uint64_t> parse_u64(const std::optional<std::string>& value)
+pm::Result<std::string> read_text_file(const std::filesystem::path& path)
 {
-    if (!value)
+    std::ifstream in{path, std::ios::binary};
+    if (!in)
     {
-        return std::nullopt;
+        return std::unexpected(pm::make_error(pm::ErrorKind::filesystem,
+                                              "failed to open file: " + path.string()));
     }
-    return std::stoull(*value);
+
+    std::ostringstream out;
+    out << in.rdbuf();
+    if (!in.good() && !in.eof())
+    {
+        return std::unexpected(pm::make_error(pm::ErrorKind::filesystem,
+                                              "failed to read file: " + path.string()));
+    }
+    return out.str();
 }
 
-pm::Result<pm::UserSlicePolicy> user_slice_from_query(uid_t uid, const Query& query)
+pm::Result<std::string> service_name_from_quadlet_path(const std::filesystem::path& path)
 {
-    pm::UserSlicePolicy policy;
-    policy.uid = uid;
-    policy.cpu_quota = query.one("cpuQuota");
-    policy.memory_max = query.one("memoryMax");
-    policy.allowed_cpus = query.one("allowedCpus");
-    try
+    const auto file_name = path.filename().string();
+    auto unit = pm::service_unit_name_from_quadlet(file_name);
+    if (!unit)
     {
-        policy.cpu_weight = parse_u64(query.one("cpuWeight"));
-        policy.tasks_max = parse_u64(query.one("tasksMax"));
+        return std::unexpected(unit.error());
     }
-    catch (const std::exception& ex)
-    {
-        return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
-                                              std::string{"invalid numeric slice policy: "} + ex.what()));
-    }
-    return policy;
+    constexpr std::string_view suffix = ".service";
+    return unit->substr(0, unit->size() - suffix.size());
 }
 
-pm::Result<std::string> handle_deploy(const Config& config, const Query& query)
+pm::Result<std::string> handle_deploy_bundle(const Config& config, const Query& query)
 {
     const auto user = query.one("user");
-    const auto name = query.one("name");
-    const auto image = query.one("image");
-    if (!user || !name || !image)
+    const auto quadlet_path = query.one("quadletPath");
+    if (!user || !quadlet_path)
     {
         return std::unexpected(pm::make_error(pm::ErrorKind::invalid_argument,
-                                              "deploy requires user, name, and image query parameters"));
+                                              "deploy-bundle requires user and quadletPath query parameters"));
     }
 
     auto target = pm::resolve_user(*user, {}, config.api_version);
@@ -305,81 +302,53 @@ pm::Result<std::string> handle_deploy(const Config& config, const Query& query)
         return std::unexpected(target.error());
     }
 
-    pm::ContainerSpec spec;
-    spec.name = *name;
-    spec.image = *image;
-    spec.command = query.many("arg");
-    if (const auto command = query.one("cmd"))
+    auto contents = read_text_file(*quadlet_path);
+    if (!contents)
     {
-        spec.command.insert(spec.command.begin(), *command);
-    }
-    spec.labels = {
-        {"com.example.podman-manager.managed", "true"},
-        {"com.example.podman-manager.target-user", target->user_name},
-    };
-
-    auto spec_json = pm::to_podman_create_json(spec);
-    if (!spec_json)
-    {
-        return std::unexpected(spec_json.error());
+        return std::unexpected(contents.error());
     }
 
-    const bool has_slice_policy = query.one("cpuQuota") || query.one("cpuWeight") || query.one("memoryMax") ||
-                                  query.one("tasksMax") || query.one("allowedCpus");
-    if (has_slice_policy)
+    auto inferred_service = service_name_from_quadlet_path(*quadlet_path);
+    if (!inferred_service)
     {
-        auto policy = user_slice_from_query(target->uid, query);
-        if (!policy)
-        {
-            return std::unexpected(policy.error());
-        }
-        if (config.apply_systemd && !config.dry_run)
-        {
-            pm::SystemctlSliceController controller;
-            if (auto applied = controller.apply(*policy); !applied)
-            {
-                return std::unexpected(applied.error());
-            }
-        }
+        return std::unexpected(inferred_service.error());
     }
 
-    if (config.dry_run)
+    pm::DeploymentBundle bundle;
+    bundle.target_uid = target->uid;
+    bundle.service_name = query.one("service").value_or(*inferred_service);
+    bundle.revision = query.one("revision").value_or("");
+    bundle.quadlet.file_name = std::filesystem::path{*quadlet_path}.filename().string();
+    bundle.quadlet.contents = *std::move(contents);
+
+    if (const auto image_archive = query.one("imageArchive"))
     {
-        return std::string{"{\"dryRun\":true,\"targetSocket\":"} + json_escape(target->socket_path.string()) +
-               ",\"createSpec\":" + *spec_json + "}\n";
+        pm::ImageArchive archive;
+        archive.path = *image_archive;
+        bundle.image_archive = archive;
     }
 
-    if (config.validate_socket)
+    pm::QuadletInstaller installer;
+    pm::SystemctlUserSystemdController systemd{config.dry_run};
+    pm::DeploymentOptions options;
+    options.api_version = config.api_version;
+    options.validate_socket = config.validate_socket;
+    options.load_image_archive = query.one("loadImage").value_or("true") != "false";
+    options.restart_unit = query.one("restart").value_or("true") != "false";
+    options.dry_run = config.dry_run;
+
+    pm::DeploymentOrchestrator deployer{installer, systemd, options};
+    auto deployed = deployer.deploy(bundle);
+    if (!deployed)
     {
-        if (auto socket = pm::validate_podman_socket(*target); !socket)
-        {
-            return std::unexpected(socket.error());
-        }
+        return std::unexpected(deployed.error());
     }
 
-    pm::PodmanClient client{*target};
-    if (auto ping = client.ping(); !ping)
-    {
-        return std::unexpected(ping.error());
-    }
-    auto created = client.create_container(spec);
-    if (!created)
-    {
-        return std::unexpected(created.error());
-    }
-
-    const bool start = query.one("start").value_or("true") != "false";
-    if (start)
-    {
-        auto started = client.start_container(spec.name);
-        if (!started)
-        {
-            return std::unexpected(started.error());
-        }
-    }
-
-    return std::string{"{\"dryRun\":false,\"container\":"} + json_escape(spec.name) + ",\"started\":" +
-           (start ? "true" : "false") + "}\n";
+    return std::string{"{\"dryRun\":"} + (deployed->dry_run ? "true" : "false") +
+           ",\"targetUser\":" + json_escape(target->user_name) +
+           ",\"installedQuadletPath\":" + json_escape(deployed->installed_quadlet_path.string()) +
+           ",\"systemdUnit\":" + json_escape(deployed->systemd_unit) +
+           ",\"jobPath\":" + json_escape(deployed->job_path) + "}\n";
 }
 
 std::string handle_request(const Config& config, std::string_view raw)
@@ -401,9 +370,9 @@ std::string handle_request(const Config& config, std::string_view raw)
         return response(200, "{\"status\":\"ok\"}\n");
     }
 
-    if (line->method == "POST" && query->path == "/v1/deploy")
+    if (line->method == "POST" && query->path == "/v1/deploy-bundle")
     {
-        auto result = handle_deploy(config, *query);
+        auto result = handle_deploy_bundle(config, *query);
         if (!result)
         {
             return response(400, "{\"error\":" + json_escape(result.error().message) + "}\n");

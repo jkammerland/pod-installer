@@ -8,12 +8,19 @@ project(
 
 option(PODMAN_MANAGER_BUILD_EXAMPLES "Build example services" ON)
 option(PODMAN_MANAGER_BUILD_TESTS "Build tests" ON)
+option(PODMAN_MANAGER_WITH_SDBUS "Build the sdbus-c++ systemd backend when available" ON)
 
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
+find_package(PkgConfig QUIET)
+
+if(PODMAN_MANAGER_WITH_SDBUS AND PkgConfig_FOUND)
+    pkg_check_modules(SDBUSCPP QUIET IMPORTED_TARGET sdbus-c++)
+endif()
 
 add_library(
     podman_manager
+    src/deployment.cpp
     src/container_spec.cpp
     src/error.cpp
     src/http.cpp
@@ -22,6 +29,10 @@ add_library(
     src/socket_validation.cpp
     src/systemd.cpp
     src/target.cpp)
+
+if(SDBUSCPP_FOUND)
+    target_sources(podman_manager PRIVATE src/systemd_sdbus.cpp)
+endif()
 
 add_library(podman_manager::podman_manager ALIAS podman_manager)
 
@@ -32,6 +43,13 @@ target_include_directories(
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
 target_link_libraries(podman_manager PUBLIC CURL::libcurl Threads::Threads)
+
+if(SDBUSCPP_FOUND)
+    target_link_libraries(podman_manager PUBLIC PkgConfig::SDBUSCPP)
+    target_compile_definitions(podman_manager PUBLIC PODMAN_MANAGER_HAS_SDBUS=1)
+else()
+    target_compile_definitions(podman_manager PUBLIC PODMAN_MANAGER_HAS_SDBUS=0)
+endif()
 
 target_compile_options(
     podman_manager
@@ -61,4 +79,3 @@ if(PODMAN_MANAGER_BUILD_TESTS)
 
     add_test(NAME podman_manager_tests COMMAND podman_manager_tests)
 endif()
-

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "podman_manager/error.hpp"
+#include "podman_manager/target.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -23,6 +24,35 @@ struct UserSlicePolicy
 Result<void> validate_user_slice_policy(const UserSlicePolicy& policy);
 Result<std::vector<std::string>> build_systemctl_set_property_args(const UserSlicePolicy& policy);
 
+struct UnitStatus
+{
+    std::string unit;
+    std::string load_state;
+    std::string active_state;
+    std::string sub_state;
+};
+
+class UserSystemdController
+{
+public:
+    virtual ~UserSystemdController() = default;
+
+    virtual Result<void> daemon_reload(const PodmanTarget& target) const = 0;
+    virtual Result<std::string> start_unit(const PodmanTarget& target,
+                                           std::string_view unit) const = 0;
+    virtual Result<std::string> restart_unit(const PodmanTarget& target,
+                                             std::string_view unit) const = 0;
+    virtual Result<std::string> stop_unit(const PodmanTarget& target,
+                                          std::string_view unit) const = 0;
+    virtual Result<UnitStatus> status(const PodmanTarget& target,
+                                      std::string_view unit) const = 0;
+};
+
+Result<void> validate_systemd_unit_name(std::string_view unit);
+Result<std::vector<std::string>> build_systemctl_user_args(const PodmanTarget& target,
+                                                           std::string_view command,
+                                                           std::optional<std::string_view> unit = std::nullopt);
+
 class SystemctlSliceController
 {
 public:
@@ -34,5 +64,41 @@ public:
 private:
     bool dry_run_{};
 };
-}
 
+class SystemctlUserSystemdController final : public UserSystemdController
+{
+public:
+    explicit SystemctlUserSystemdController(bool dry_run = false);
+
+    [[nodiscard]] bool dry_run() const noexcept;
+
+    Result<void> daemon_reload(const PodmanTarget& target) const override;
+    Result<std::string> start_unit(const PodmanTarget& target,
+                                   std::string_view unit) const override;
+    Result<std::string> restart_unit(const PodmanTarget& target,
+                                     std::string_view unit) const override;
+    Result<std::string> stop_unit(const PodmanTarget& target,
+                                  std::string_view unit) const override;
+    Result<UnitStatus> status(const PodmanTarget& target,
+                              std::string_view unit) const override;
+
+private:
+    bool dry_run_{};
+};
+
+#if PODMAN_MANAGER_HAS_SDBUS
+class SdbusUserSystemdController final : public UserSystemdController
+{
+public:
+    Result<void> daemon_reload(const PodmanTarget& target) const override;
+    Result<std::string> start_unit(const PodmanTarget& target,
+                                   std::string_view unit) const override;
+    Result<std::string> restart_unit(const PodmanTarget& target,
+                                     std::string_view unit) const override;
+    Result<std::string> stop_unit(const PodmanTarget& target,
+                                  std::string_view unit) const override;
+    Result<UnitStatus> status(const PodmanTarget& target,
+                              std::string_view unit) const override;
+};
+#endif
+}

@@ -1,8 +1,11 @@
 #include "podman_manager/systemd.hpp"
 
 #include <cerrno>
+#include <cctype>
 #include <cstring>
+#include <fcntl.h>
 #include <spawn.h>
+#include <sstream>
 #include <string_view>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -27,6 +30,23 @@ bool safe_systemd_value(std::string_view value)
         }
     }
     return true;
+}
+
+bool safe_systemd_unit(std::string_view unit)
+{
+    if (unit.empty() || unit.size() > 255)
+    {
+        return false;
+    }
+    for (const unsigned char c : unit)
+    {
+        if (!(std::isalnum(c) || c == '_' || c == '-' || c == '.' || c == '@' || c == '\\'))
+        {
+            return false;
+        }
+    }
+    return unit.ends_with(".service") || unit.ends_with(".socket") || unit.ends_with(".timer") ||
+           unit.ends_with(".target");
 }
 
 Result<void> run_process(const std::vector<std::string>& args)
@@ -71,6 +91,127 @@ Result<void> run_process(const std::vector<std::string>& args)
     }
 
     return {};
+}
+
+Result<std::string> run_process_capture(const std::vector<std::string>& args)
+{
+    if (args.empty())
+    {
+        return std::unexpected(make_error(ErrorKind::systemd, "no process arguments supplied"));
+    }
+
+    int pipe_fds[2]{};
+    if (pipe2(pipe_fds, O_CLOEXEC) != 0)
+    {
+        return std::unexpected(make_error(ErrorKind::systemd,
+                                          "pipe2 failed: " + std::string{std::strerror(errno)},
+                                          0,
+                                          errno));
+    }
+
+    posix_spawn_file_actions_t actions{};
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, pipe_fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipe_fds[0]);
+    posix_spawn_file_actions_addclose(&actions, pipe_fds[1]);
+
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args)
+    {
+        argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    pid_t pid{};
+    const int spawn_rc = posix_spawnp(&pid, args.front().c_str(), &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipe_fds[1]);
+
+    if (spawn_rc != 0)
+    {
+        close(pipe_fds[0]);
+        return std::unexpected(make_error(ErrorKind::systemd,
+                                          "posix_spawnp failed for '" + args.front() + "': " +
+                                              std::strerror(spawn_rc),
+                                          0,
+                                          spawn_rc));
+    }
+
+    std::string output;
+    char buffer[4096];
+    for (;;)
+    {
+        const auto n = read(pipe_fds[0], buffer, sizeof(buffer));
+        if (n > 0)
+        {
+            output.append(buffer, static_cast<size_t>(n));
+            continue;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        close(pipe_fds[0]);
+        return std::unexpected(make_error(ErrorKind::systemd,
+                                          "read failed for systemctl output: " +
+                                              std::string{std::strerror(errno)},
+                                          0,
+                                          errno));
+    }
+    close(pipe_fds[0]);
+
+    int status{};
+    if (waitpid(pid, &status, 0) < 0)
+    {
+        return std::unexpected(make_error(ErrorKind::systemd,
+                                          "waitpid failed for systemctl: " + std::string{std::strerror(errno)},
+                                          0,
+                                          errno));
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    {
+        return std::unexpected(make_error(ErrorKind::systemd,
+                                          "systemctl exited with status " + std::to_string(status) +
+                                              " output: " + output));
+    }
+    return output;
+}
+
+UnitStatus parse_show_status(std::string_view unit, std::string_view output)
+{
+    UnitStatus status;
+    status.unit = std::string{unit};
+
+    std::istringstream in{std::string{output}};
+    std::string line;
+    while (std::getline(in, line))
+    {
+        const auto eq = line.find('=');
+        if (eq == std::string::npos)
+        {
+            continue;
+        }
+        const auto key = line.substr(0, eq);
+        const auto value = line.substr(eq + 1);
+        if (key == "LoadState")
+        {
+            status.load_state = value;
+        }
+        else if (key == "ActiveState")
+        {
+            status.active_state = value;
+        }
+        else if (key == "SubState")
+        {
+            status.sub_state = value;
+        }
+    }
+    return status;
 }
 }
 
@@ -144,6 +285,51 @@ Result<std::vector<std::string>> build_systemctl_set_property_args(const UserSli
     return args;
 }
 
+Result<void> validate_systemd_unit_name(std::string_view unit)
+{
+    if (!safe_systemd_unit(unit))
+    {
+        return std::unexpected(make_error(ErrorKind::invalid_argument,
+                                          "unsupported systemd unit name: " + std::string{unit}));
+    }
+    return {};
+}
+
+Result<std::vector<std::string>> build_systemctl_user_args(const PodmanTarget& target,
+                                                           std::string_view command,
+                                                           std::optional<std::string_view> unit)
+{
+    if (target.user_name.empty())
+    {
+        return std::unexpected(make_error(ErrorKind::invalid_argument,
+                                          "systemctl user commands require target user_name"));
+    }
+    if (!safe_systemd_value(command))
+    {
+        return std::unexpected(make_error(ErrorKind::invalid_argument,
+                                          "invalid systemctl command"));
+    }
+    if (unit)
+    {
+        if (auto result = validate_systemd_unit_name(*unit); !result)
+        {
+            return std::unexpected(result.error());
+        }
+    }
+
+    std::vector<std::string> args{
+        "systemctl",
+        "--user",
+        "--machine=" + target.user_name + "@.host",
+        std::string{command},
+    };
+    if (unit)
+    {
+        args.push_back(std::string{*unit});
+    }
+    return args;
+}
+
 SystemctlSliceController::SystemctlSliceController(bool dry_run)
     : dry_run_{dry_run}
 {
@@ -166,5 +352,117 @@ Result<void> SystemctlSliceController::apply(const UserSlicePolicy& policy) cons
         return {};
     }
     return run_process(*args);
+}
+
+SystemctlUserSystemdController::SystemctlUserSystemdController(bool dry_run)
+    : dry_run_{dry_run}
+{
+}
+
+bool SystemctlUserSystemdController::dry_run() const noexcept
+{
+    return dry_run_;
+}
+
+Result<void> SystemctlUserSystemdController::daemon_reload(const PodmanTarget& target) const
+{
+    auto args = build_systemctl_user_args(target, "daemon-reload");
+    if (!args)
+    {
+        return std::unexpected(args.error());
+    }
+    if (dry_run_)
+    {
+        return {};
+    }
+    return run_process(*args);
+}
+
+Result<std::string> SystemctlUserSystemdController::start_unit(const PodmanTarget& target,
+                                                               std::string_view unit) const
+{
+    auto args = build_systemctl_user_args(target, "start", unit);
+    if (!args)
+    {
+        return std::unexpected(args.error());
+    }
+    if (dry_run_)
+    {
+        return {};
+    }
+    if (auto result = run_process(*args); !result)
+    {
+        return std::unexpected(result.error());
+    }
+    return {};
+}
+
+Result<std::string> SystemctlUserSystemdController::restart_unit(const PodmanTarget& target,
+                                                                 std::string_view unit) const
+{
+    auto args = build_systemctl_user_args(target, "restart", unit);
+    if (!args)
+    {
+        return std::unexpected(args.error());
+    }
+    if (dry_run_)
+    {
+        return {};
+    }
+    if (auto result = run_process(*args); !result)
+    {
+        return std::unexpected(result.error());
+    }
+    return {};
+}
+
+Result<std::string> SystemctlUserSystemdController::stop_unit(const PodmanTarget& target,
+                                                              std::string_view unit) const
+{
+    auto args = build_systemctl_user_args(target, "stop", unit);
+    if (!args)
+    {
+        return std::unexpected(args.error());
+    }
+    if (dry_run_)
+    {
+        return {};
+    }
+    if (auto result = run_process(*args); !result)
+    {
+        return std::unexpected(result.error());
+    }
+    return {};
+}
+
+Result<UnitStatus> SystemctlUserSystemdController::status(const PodmanTarget& target,
+                                                          std::string_view unit) const
+{
+    if (auto result = validate_systemd_unit_name(unit); !result)
+    {
+        return std::unexpected(result.error());
+    }
+    if (dry_run_)
+    {
+        UnitStatus out;
+        out.unit = std::string{unit};
+        return out;
+    }
+
+    auto args = build_systemctl_user_args(target, "show", unit);
+    if (!args)
+    {
+        return std::unexpected(args.error());
+    }
+    args->push_back("--property=LoadState");
+    args->push_back("--property=ActiveState");
+    args->push_back("--property=SubState");
+
+    auto output = run_process_capture(*args);
+    if (!output)
+    {
+        return std::unexpected(output.error());
+    }
+    return parse_show_status(unit, *output);
 }
 }

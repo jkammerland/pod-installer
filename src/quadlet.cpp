@@ -6,8 +6,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <optional>
-#include <set>
 #include <ranges>
+#include <set>
+#include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
@@ -107,17 +108,9 @@ bool safe_unit_file_char(unsigned char c)
     return std::isalnum(c) || c == '_' || c == '-' || c == '.' || c == '@';
 }
 
-bool starts_with_token(std::string_view value, std::string_view token)
+bool starts_with_option_assignment(std::string_view value, std::string_view option)
 {
-    if (value.size() < token.size())
-    {
-        return false;
-    }
-    if (lower_ascii(value.substr(0, token.size())) != lower_ascii(token))
-    {
-        return false;
-    }
-    return value.size() == token.size() || value[token.size()] == '=' || value[token.size()] == ' ';
+    return value.size() > option.size() && value.starts_with(option) && value[option.size()] == '=';
 }
 
 bool equals_key(std::string_view value, std::string_view expected)
@@ -125,48 +118,123 @@ bool equals_key(std::string_view value, std::string_view expected)
     return lower_ascii(trim(value)) == lower_ascii(expected);
 }
 
+std::vector<std::string> split_podman_args(std::string_view value)
+{
+    std::vector<std::string> tokens;
+    std::string current;
+    bool in_single = false;
+    bool in_double = false;
+    bool escaped = false;
+
+    for (const char c : value)
+    {
+        if (escaped)
+        {
+            current.push_back(c);
+            escaped = false;
+            continue;
+        }
+        if (c == '\\' && !in_single)
+        {
+            escaped = true;
+            continue;
+        }
+        if (c == '\'' && !in_double)
+        {
+            in_single = !in_single;
+            continue;
+        }
+        if (c == '"' && !in_single)
+        {
+            in_double = !in_double;
+            continue;
+        }
+        if (std::isspace(static_cast<unsigned char>(c)) && !in_single && !in_double)
+        {
+            if (!current.empty())
+            {
+                tokens.push_back(std::move(current));
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (escaped)
+    {
+        current.push_back('\\');
+    }
+    if (!current.empty())
+    {
+        tokens.push_back(std::move(current));
+    }
+    return tokens;
+}
+
+std::string option_value(std::string_view token, std::string_view option)
+{
+    if (starts_with_option_assignment(token, option))
+    {
+        return std::string{token.substr(option.size() + 1)};
+    }
+    return {};
+}
+
+bool token_has_value(std::string_view token,
+                     std::string_view next,
+                     std::string_view option,
+                     std::string_view denied_value)
+{
+    const auto assigned = lower_ascii(option_value(token, option));
+    if (!assigned.empty())
+    {
+        return assigned == lower_ascii(denied_value);
+    }
+    return lower_ascii(token) == lower_ascii(option) && lower_ascii(next) == lower_ascii(denied_value);
+}
+
 bool denied_podman_arg(std::string_view value, const QuadletPolicy& policy)
 {
-    auto parts = std::views::split(value, ' ');
-    for (const auto part_range : parts)
+    const auto parts = split_podman_args(value);
+    for (size_t i = 0; i < parts.size(); ++i)
     {
-        const std::string part{part_range.begin(), part_range.end()};
+        const auto& part = parts[i];
+        const auto next = i + 1 < parts.size() ? std::string_view{parts[i + 1]} : std::string_view{};
         if (part.empty())
         {
             continue;
         }
-        if (!policy.allow_privileged && part == "--privileged")
+        if (!policy.allow_privileged &&
+            (lower_ascii(part) == "--privileged" || lower_ascii(part) == "--privileged=true"))
         {
             return true;
         }
-        if (!policy.allow_privileged && starts_with_token(part, "--privileged=true"))
+        if (!policy.allow_host_network && (token_has_value(part, next, "--network", "host") ||
+                                           token_has_value(part, next, "--net", "host")))
         {
             return true;
         }
-        if (!policy.allow_host_network &&
-            (starts_with_token(part, "--network=host") || starts_with_token(part, "--net=host")))
+        if (!policy.allow_host_pid && token_has_value(part, next, "--pid", "host"))
         {
             return true;
         }
-        if (!policy.allow_host_pid && starts_with_token(part, "--pid=host"))
+        if (!policy.allow_host_ipc && token_has_value(part, next, "--ipc", "host"))
         {
             return true;
         }
-        if (!policy.allow_host_ipc && starts_with_token(part, "--ipc=host"))
+        if (!policy.allow_host_userns && token_has_value(part, next, "--userns", "host"))
         {
             return true;
         }
-        if (!policy.allow_host_userns && starts_with_token(part, "--userns=host"))
-        {
-            return true;
-        }
-        if (!policy.allow_devices && starts_with_token(part, "--device"))
+        if (!policy.allow_devices &&
+            (lower_ascii(part) == "--device" || starts_with_option_assignment(lower_ascii(part), "--device")))
         {
             return true;
         }
         if (!policy.allow_root_mount &&
-            (starts_with_token(part, "--volume") || starts_with_token(part, "-v") ||
-             starts_with_token(part, "--mount")))
+            (lower_ascii(part) == "--volume" || starts_with_option_assignment(lower_ascii(part), "--volume") ||
+             lower_ascii(part) == "-v" || starts_with_option_assignment(lower_ascii(part), "-v") ||
+             lower_ascii(part) == "--mount" || starts_with_option_assignment(lower_ascii(part), "--mount")))
         {
             return true;
         }
@@ -177,15 +245,44 @@ bool denied_podman_arg(std::string_view value, const QuadletPolicy& policy)
 bool host_path_volume(std::string_view value)
 {
     const auto trimmed = trim(value);
-    return trimmed.starts_with("/");
+    const auto colon = trimmed.find(':');
+    const auto source = trim(colon == std::string::npos ? trimmed : std::string_view{trimmed}.substr(0, colon));
+    if (source.empty())
+    {
+        return false;
+    }
+    return source.starts_with("/") || source.starts_with(".") || source.starts_with("~") ||
+           source.starts_with("$") || source.find('/') != std::string::npos ||
+           source.find('\\') != std::string::npos || source.find("..") != std::string::npos ||
+           source.find('%') != std::string::npos;
 }
 
 bool host_path_mount(std::string_view value)
 {
-    const auto normalized = lower_ascii(trim(value));
-    return normalized.find("source=/") != std::string::npos ||
-           normalized.find("src=/") != std::string::npos ||
-           normalized.find("from=/") != std::string::npos;
+    std::istringstream in{trim(value)};
+    std::string part;
+    while (std::getline(in, part, ','))
+    {
+        const auto eq = part.find('=');
+        const auto key = lower_ascii(trim(eq == std::string::npos ? part : std::string_view{part}.substr(0, eq)));
+        const auto val = trim(eq == std::string::npos ? "" : std::string_view{part}.substr(eq + 1));
+        const auto lower_value = lower_ascii(val);
+        if (key == "type" && lower_value == "bind")
+        {
+            return true;
+        }
+        if (key == "source" || key == "src" || key == "from")
+        {
+            if (val.starts_with("/") || val.starts_with(".") || val.starts_with("~") ||
+                val.starts_with("$") || val.find('/') != std::string::npos ||
+                val.find('\\') != std::string::npos || val.find("..") != std::string::npos ||
+                val.find('%') != std::string::npos)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool dangerous_service_key(std::string_view key)
@@ -596,10 +693,11 @@ Result<void> validate_quadlet_file_name(std::string_view file_name)
         return std::unexpected(make_error(ErrorKind::invalid_argument,
                                           "Quadlet file name must be 1 to 255 bytes"));
     }
-    if (file_name == "." || file_name == ".." || file_name.starts_with('.'))
+    if (file_name == "." || file_name == ".." || file_name.starts_with('.') ||
+        file_name.starts_with('-'))
     {
         return std::unexpected(make_error(ErrorKind::invalid_argument,
-                                          "Quadlet file name must not be hidden or relative"));
+                                          "Quadlet file name must not be hidden, relative, or option-like"));
     }
     if (contains_control_or_slash(file_name))
     {
@@ -847,6 +945,11 @@ const QuadletPolicy& QuadletInstaller::policy() const noexcept
 
 Result<InstalledQuadlet> QuadletInstaller::expected_install(uid_t uid, const QuadletFile& quadlet) const
 {
+    if (quadlet.contents.size() > layout_.max_quadlet_bytes)
+    {
+        return std::unexpected(make_error(ErrorKind::policy,
+                                          "Quadlet contents exceed max_quadlet_bytes"));
+    }
     if (auto result = validate_quadlet_policy(quadlet, policy_); !result)
     {
         return std::unexpected(result.error());

@@ -2,11 +2,16 @@
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <cerrno>
-#include <cstdio>
+#include <cstdint>
 #include <cstring>
+#include <fcntl.h>
+#include <limits>
 #include <memory>
 #include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 
 namespace podman_manager
@@ -86,23 +91,91 @@ size_t write_header(char* ptr, size_t size, size_t nmemb, void* userdata)
     return size * nmemb;
 }
 
-struct FileCloser
+class FileDescriptor
 {
-    void operator()(FILE* file) const noexcept
+public:
+    explicit FileDescriptor(int fd = -1) noexcept
+        : fd_{fd}
     {
-        if (file != nullptr)
-        {
-            fclose(file);
-        }
     }
+
+    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
+
+    FileDescriptor(FileDescriptor&& other) noexcept
+        : fd_{std::exchange(other.fd_, -1)}
+    {
+    }
+
+    FileDescriptor& operator=(FileDescriptor&& other) noexcept
+    {
+        if (this != &other)
+        {
+            reset();
+            fd_ = std::exchange(other.fd_, -1);
+        }
+        return *this;
+    }
+
+    ~FileDescriptor()
+    {
+        reset();
+    }
+
+    [[nodiscard]] int get() const noexcept
+    {
+        return fd_;
+    }
+
+    void reset(int fd = -1) noexcept
+    {
+        if (fd_ >= 0)
+        {
+            close(fd_);
+        }
+        fd_ = fd;
+    }
+
+private:
+    int fd_{};
 };
 
-using FilePtr = std::unique_ptr<FILE, FileCloser>;
-
-size_t read_file(char* buffer, size_t size, size_t nitems, void* userdata)
+struct FdUpload
 {
-    auto* file = static_cast<FILE*>(userdata);
-    return fread(buffer, size, nitems, file);
+    int fd{};
+    uintmax_t offset{};
+    uintmax_t size{};
+};
+
+size_t read_fd_upload(char* buffer, size_t size, size_t nitems, void* userdata)
+{
+    auto* upload = static_cast<FdUpload*>(userdata);
+    const auto requested = size * nitems;
+    if (requested == 0 || upload->offset >= upload->size)
+    {
+        return 0;
+    }
+
+    const auto remaining = upload->size - upload->offset;
+    const auto limit = static_cast<uintmax_t>(std::numeric_limits<ssize_t>::max());
+    const auto to_read = static_cast<size_t>(std::min<uintmax_t>({requested, remaining, limit}));
+    for (;;)
+    {
+        const auto n = pread(upload->fd,
+                             buffer,
+                             to_read,
+                             static_cast<off_t>(upload->offset));
+        if (n >= 0)
+        {
+            upload->offset += static_cast<uintmax_t>(n);
+            return static_cast<size_t>(n);
+        }
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        return CURL_READFUNC_ABORT;
+    }
 }
 
 HeaderList make_headers(const std::vector<std::string>& headers)
@@ -341,25 +414,72 @@ Result<HttpResponse> PodmanClient::remove_container(std::string_view name, bool 
 
 Result<HttpResponse> PodmanClient::load_image_archive(const std::filesystem::path& archive_path) const
 {
-    (void)curl_global();
-
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(archive_path, ec);
-    if (ec)
-    {
-        return std::unexpected(make_error(ErrorKind::filesystem,
-                                          "failed to stat image archive '" + archive_path.string() + "': " +
-                                              ec.message()));
-    }
-
-    FilePtr file{fopen(archive_path.c_str(), "rb")};
-    if (!file)
+    FileDescriptor fd{open(archive_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+    if (fd.get() < 0)
     {
         return std::unexpected(make_error(ErrorKind::filesystem,
                                           "failed to open image archive '" + archive_path.string() + "': " +
                                               std::strerror(errno),
                                           0,
                                           errno));
+    }
+
+    struct stat st
+    {
+    };
+    if (fstat(fd.get(), &st) != 0)
+    {
+        return std::unexpected(make_error(ErrorKind::filesystem,
+                                          "failed to stat image archive '" + archive_path.string() + "': " +
+                                              std::strerror(errno),
+                                          0,
+                                          errno));
+    }
+    if (!S_ISREG(st.st_mode))
+    {
+        return std::unexpected(make_error(ErrorKind::filesystem,
+                                          "image archive is not a regular file: " + archive_path.string()));
+    }
+    if (st.st_size < 0)
+    {
+        return std::unexpected(make_error(ErrorKind::filesystem,
+                                          "image archive has invalid size: " + archive_path.string()));
+    }
+
+    return load_image_archive_fd(fd.get(), static_cast<uintmax_t>(st.st_size));
+}
+
+Result<HttpResponse> PodmanClient::load_image_archive_fd(int archive_fd, uintmax_t archive_size) const
+{
+    (void)curl_global();
+
+    if (archive_fd < 0)
+    {
+        return std::unexpected(make_error(ErrorKind::invalid_argument, "image archive fd is invalid"));
+    }
+    struct stat st
+    {
+    };
+    if (fstat(archive_fd, &st) != 0)
+    {
+        return std::unexpected(make_error(ErrorKind::filesystem,
+                                          "failed to stat image archive fd: " + std::string{std::strerror(errno)},
+                                          0,
+                                          errno));
+    }
+    if (!S_ISREG(st.st_mode))
+    {
+        return std::unexpected(make_error(ErrorKind::filesystem,
+                                          "image archive fd is not a regular file"));
+    }
+    if (st.st_size < 0 || archive_size > static_cast<uintmax_t>(st.st_size))
+    {
+        return std::unexpected(make_error(ErrorKind::invalid_argument,
+                                          "image archive fd size is invalid"));
+    }
+    if (archive_size > static_cast<uintmax_t>(std::numeric_limits<curl_off_t>::max()))
+    {
+        return std::unexpected(make_error(ErrorKind::invalid_argument, "image archive is too large for curl"));
     }
 
     CurlHandle curl{curl_easy_init()};
@@ -372,13 +492,14 @@ Result<HttpResponse> PodmanClient::load_image_archive(const std::filesystem::pat
     const auto socket_path = target_.socket_path.string();
     const auto url = options_.base_url + versioned_path("/libpod/images/load");
     HeaderList headers = make_headers({"Content-Type: application/x-tar"});
+    FdUpload upload{.fd = archive_fd, .size = archive_size};
 
     curl_easy_setopt(curl.get(), CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_POST, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(size));
-    curl_easy_setopt(curl.get(), CURLOPT_READFUNCTION, read_file);
-    curl_easy_setopt(curl.get(), CURLOPT_READDATA, file.get());
+    curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(archive_size));
+    curl_easy_setopt(curl.get(), CURLOPT_READFUNCTION, read_fd_upload);
+    curl_easy_setopt(curl.get(), CURLOPT_READDATA, &upload);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, static_cast<long>(options_.timeout.count()));
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, write_body);

@@ -36,10 +36,10 @@ public:
     Result<HttpResponse> stop_container(std::string_view name, int timeout_seconds = 10) const;
     Result<HttpResponse> remove_container(std::string_view name, bool force = false) const;
     Result<HttpResponse> load_image_archive(const std::filesystem::path& archive_path) const;
+    Result<HttpResponse> load_image_archive_fd(int archive_fd, uintmax_t archive_size) const;
 
 private:
     PodmanTarget target_;
     ClientOptions options_;
 };
 }
-

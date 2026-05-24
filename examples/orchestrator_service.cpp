@@ -2,11 +2,13 @@
 
 #include <arpa/inet.h>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <netinet/in.h>
@@ -17,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace pm = podman_manager;
@@ -265,84 +268,155 @@ std::string response(int status, std::string_view body, std::string_view content
     return out.str();
 }
 
-bool path_starts_with(const std::filesystem::path& child, const std::filesystem::path& parent)
+class FileDescriptor
 {
-    auto child_it = child.begin();
-    auto parent_it = parent.begin();
-    for (; parent_it != parent.end(); ++parent_it, ++child_it)
+public:
+    explicit FileDescriptor(int fd = -1) noexcept
+        : fd_{fd}
     {
-        if (child_it == child.end() || *child_it != *parent_it)
-        {
-            return false;
-        }
     }
-    return true;
+
+    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
+
+    FileDescriptor(FileDescriptor&& other) noexcept
+        : fd_{std::exchange(other.fd_, -1)}
+    {
+    }
+
+    FileDescriptor& operator=(FileDescriptor&& other) noexcept
+    {
+        if (this != &other)
+        {
+            reset();
+            fd_ = std::exchange(other.fd_, -1);
+        }
+        return *this;
+    }
+
+    ~FileDescriptor()
+    {
+        reset();
+    }
+
+    [[nodiscard]] int get() const noexcept
+    {
+        return fd_;
+    }
+
+    void reset(int fd = -1) noexcept
+    {
+        if (fd_ >= 0)
+        {
+            close(fd_);
+        }
+        fd_ = fd;
+    }
+
+private:
+    int fd_{};
+};
+
+bool path_component_is_safe(const std::filesystem::path& component)
+{
+    const auto value = component.string();
+    return !value.empty() && value != "." && value != "..";
 }
 
-pm::Result<std::string> read_staged_regular_file(const std::filesystem::path& staging_root,
-                                                 const std::filesystem::path& path,
-                                                 size_t max_size)
+pm::Result<std::filesystem::path> staged_relative_path(const std::filesystem::path& staging_root,
+                                                       const std::filesystem::path& requested)
 {
-    std::error_code ec;
-    const auto canonical_root = std::filesystem::weakly_canonical(staging_root, ec);
-    if (ec)
+    auto normalized = requested.lexically_normal();
+    if (normalized.is_absolute())
     {
-        return std::unexpected(pm::make_error(pm::ErrorKind::filesystem,
-                                              "failed to resolve staging root: " + ec.message()));
-    }
-    const auto canonical_path = std::filesystem::weakly_canonical(path, ec);
-    if (ec)
-    {
-        return std::unexpected(pm::make_error(pm::ErrorKind::filesystem,
-                                              "failed to resolve staged file: " + ec.message()));
-    }
-    if (!path_starts_with(canonical_path, canonical_root))
-    {
-        return std::unexpected(pm::make_error(pm::ErrorKind::policy,
-                                              "staged file is outside staging root: " + canonical_path.string()));
-    }
-
-    struct stat lst
-    {
-    };
-    if (lstat(path.c_str(), &lst) != 0)
-    {
-        return std::unexpected(pm::make_error(pm::ErrorKind::filesystem,
-                                              "failed to lstat staged file: " + std::string{std::strerror(errno)},
-                                              0,
-                                              errno));
-    }
-    if (S_ISLNK(lst.st_mode))
-    {
-        return std::unexpected(pm::make_error(pm::ErrorKind::policy,
-                                              "staged file must not be a symlink"));
-    }
-
-    const int raw_fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (raw_fd < 0)
-    {
-        return std::unexpected(pm::make_error(pm::ErrorKind::filesystem,
-                                              "failed to open staged file: " + std::string{std::strerror(errno)},
-                                              0,
-                                              errno));
-    }
-    struct CloseFd
-    {
-        void operator()(int* fd) const noexcept
+        const auto normalized_root = staging_root.lexically_normal();
+        auto path_it = normalized.begin();
+        auto root_it = normalized_root.begin();
+        for (; root_it != normalized_root.end(); ++root_it, ++path_it)
         {
-            if (fd != nullptr && *fd >= 0)
+            if (path_it == normalized.end() || *path_it != *root_it)
             {
-                close(*fd);
+                return std::unexpected(pm::make_error(pm::ErrorKind::policy,
+                                                      "staged file is outside staging root: " +
+                                                          normalized.string()));
             }
-            delete fd;
         }
-    };
-    std::unique_ptr<int, CloseFd> fd{new int{raw_fd}};
+        std::filesystem::path relative;
+        for (; path_it != normalized.end(); ++path_it)
+        {
+            relative /= *path_it;
+        }
+        normalized = relative;
+    }
+    if (normalized.empty() || normalized == ".")
+    {
+        return std::unexpected(pm::make_error(pm::ErrorKind::policy,
+                                              "staged file path is empty"));
+    }
+    for (const auto& component : normalized)
+    {
+        if (!path_component_is_safe(component))
+        {
+            return std::unexpected(pm::make_error(pm::ErrorKind::policy,
+                                                  "staged file path must not contain '.' or '..': " +
+                                                      normalized.string()));
+        }
+    }
+    return normalized;
+}
+
+struct OpenStagedFile
+{
+    FileDescriptor fd;
+    size_t size{};
+    std::filesystem::path relative_path;
+};
+
+pm::Result<OpenStagedFile> open_staged_regular_file(const std::filesystem::path& staging_root,
+                                                    const std::filesystem::path& requested,
+                                                    size_t max_size)
+{
+    auto relative = staged_relative_path(staging_root, requested);
+    if (!relative)
+    {
+        return std::unexpected(relative.error());
+    }
+
+    FileDescriptor current{open(staging_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
+    if (current.get() < 0)
+    {
+        return std::unexpected(pm::make_error(pm::ErrorKind::filesystem,
+                                              "failed to open staging root: " +
+                                                  std::string{std::strerror(errno)},
+                                              0,
+                                              errno));
+    }
+
+    auto component = relative->begin();
+    for (; component != relative->end(); ++component)
+    {
+        const auto next = std::next(component);
+        const auto name = component->string();
+        const bool final = next == relative->end();
+        FileDescriptor next_fd{openat(current.get(),
+                                      name.c_str(),
+                                      final ? (O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+                                            : (O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW))};
+        if (next_fd.get() < 0)
+        {
+            return std::unexpected(pm::make_error(pm::ErrorKind::filesystem,
+                                                  "failed to open staged file component '" + name + "': " +
+                                                      std::string{std::strerror(errno)},
+                                                  0,
+                                                  errno));
+        }
+        current = std::move(next_fd);
+    }
 
     struct stat st
     {
     };
-    if (fstat(*fd, &st) != 0)
+    if (fstat(current.get(), &st) != 0)
     {
         return std::unexpected(pm::make_error(pm::ErrorKind::filesystem,
                                               "failed to stat staged file: " + std::string{std::strerror(errno)},
@@ -357,14 +431,28 @@ pm::Result<std::string> read_staged_regular_file(const std::filesystem::path& st
     if (st.st_size < 0 || static_cast<uintmax_t>(st.st_size) > max_size)
     {
         return std::unexpected(pm::make_error(pm::ErrorKind::policy,
-                                              "staged Quadlet file is too large"));
+                                              "staged file is too large"));
+    }
+    return OpenStagedFile{.fd = std::move(current),
+                          .size = static_cast<size_t>(st.st_size),
+                          .relative_path = *std::move(relative)};
+}
+
+pm::Result<std::string> read_staged_regular_file(const std::filesystem::path& staging_root,
+                                                 const std::filesystem::path& path,
+                                                 size_t max_size)
+{
+    auto file = open_staged_regular_file(staging_root, path, max_size);
+    if (!file)
+    {
+        return std::unexpected(file.error());
     }
 
-    std::string out(static_cast<size_t>(st.st_size), '\0');
+    std::string out(file->size, '\0');
     size_t offset = 0;
     while (offset < out.size())
     {
-        const auto n = read(*fd, out.data() + offset, out.size() - offset);
+        const auto n = read(file->fd.get(), out.data() + offset, out.size() - offset);
         if (n < 0)
         {
             if (errno == EINTR)
@@ -436,8 +524,15 @@ pm::Result<std::string> handle_deploy_bundle(const Config& config, const Query& 
 
     if (const auto image_archive = query.one("imageArchive"))
     {
+        auto staged_image = open_staged_regular_file(config.staging_root,
+                                                     *image_archive,
+                                                     8ULL * 1024ULL * 1024ULL * 1024ULL);
+        if (!staged_image)
+        {
+            return std::unexpected(staged_image.error());
+        }
         pm::ImageArchive archive;
-        archive.path = *image_archive;
+        archive.path = staged_image->relative_path;
         bundle.image_archive = archive;
     }
 
@@ -446,6 +541,7 @@ pm::Result<std::string> handle_deploy_bundle(const Config& config, const Query& 
     pm::DeploymentOptions options;
     options.api_version = config.api_version;
     options.validate_socket = config.validate_socket;
+    options.image_archive_root = config.staging_root;
     options.load_image_archive = query.one("loadImage").value_or("true") != "false";
     options.restart_unit = query.one("restart").value_or("true") != "false";
     options.dry_run = config.dry_run;

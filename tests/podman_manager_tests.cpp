@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +22,18 @@ namespace pm = podman_manager;
 
 namespace
 {
+void test_check(bool condition, const char* expression, const char* file, int line)
+{
+    if (!condition)
+    {
+        std::cerr << file << ':' << line << ": check failed: " << expression << '\n';
+        std::abort();
+    }
+}
+
+#undef assert
+#define assert(expr) test_check(static_cast<bool>(expr), #expr, __FILE__, __LINE__)
+
 std::string valid_quadlet_contents()
 {
     return "[Unit]\n"
@@ -96,6 +109,7 @@ class FailingRestartSystemdController final : public pm::UserSystemdController
 {
 public:
     mutable std::vector<std::string> calls;
+    mutable int restart_calls{};
 
     pm::Result<void> daemon_reload(const pm::PodmanTarget&) const override
     {
@@ -111,12 +125,55 @@ public:
     pm::Result<pm::UnitOperationResult> restart_unit(const pm::PodmanTarget&, std::string_view unit) const override
     {
         calls.push_back("restart " + std::string{unit});
+        ++restart_calls;
         return std::unexpected(pm::make_error(pm::ErrorKind::systemd, "restart failed"));
     }
 
     pm::Result<pm::UnitOperationResult> stop_unit(const pm::PodmanTarget&, std::string_view) const override
     {
         return std::unexpected(pm::make_error(pm::ErrorKind::systemd, "stop failed"));
+    }
+
+    pm::Result<pm::UnitStatus> status(const pm::PodmanTarget&, std::string_view unit) const override
+    {
+        return pm::UnitStatus{.unit = std::string{unit},
+                              .load_state = "loaded",
+                              .active_state = "failed",
+                              .sub_state = "failed"};
+    }
+};
+
+class UnhealthyRestartSystemdController final : public pm::UserSystemdController
+{
+public:
+    mutable std::vector<std::string> calls;
+
+    pm::Result<void> daemon_reload(const pm::PodmanTarget&) const override
+    {
+        calls.push_back("daemon-reload");
+        return {};
+    }
+
+    pm::Result<pm::UnitOperationResult> start_unit(const pm::PodmanTarget&, std::string_view) const override
+    {
+        return std::unexpected(pm::make_error(pm::ErrorKind::systemd, "start not used"));
+    }
+
+    pm::Result<pm::UnitOperationResult> restart_unit(const pm::PodmanTarget&, std::string_view unit) const override
+    {
+        calls.push_back("restart " + std::string{unit});
+        pm::UnitOperationResult out;
+        out.job_path = "/org/freedesktop/systemd1/job/restart";
+        out.final_status = pm::UnitStatus{.unit = std::string{unit},
+                                          .load_state = "loaded",
+                                          .active_state = "failed",
+                                          .sub_state = "failed"};
+        return out;
+    }
+
+    pm::Result<pm::UnitOperationResult> stop_unit(const pm::PodmanTarget&, std::string_view) const override
+    {
+        return std::unexpected(pm::make_error(pm::ErrorKind::systemd, "stop not used"));
     }
 
     pm::Result<pm::UnitStatus> status(const pm::PodmanTarget&, std::string_view unit) const override
@@ -331,6 +388,7 @@ void test_systemd_args()
     assert((*user_args)[3] == "restart");
     assert((*user_args)[4] == "demo.service");
     assert(!pm::build_systemctl_user_args(target, "restart", "../bad.service"));
+    assert(!pm::build_systemctl_user_args(target, "restart", "-demo.service"));
 }
 
 void test_quadlet_policy_and_install()
@@ -347,6 +405,10 @@ void test_quadlet_policy_and_install()
 
     pm::QuadletFile bad = quadlet;
     bad.file_name = "../demo.container";
+    assert(!pm::validate_quadlet_policy(bad));
+
+    bad = quadlet;
+    bad.file_name = "-demo.container";
     assert(!pm::validate_quadlet_policy(bad));
 
     bad = quadlet;
@@ -372,6 +434,16 @@ void test_quadlet_policy_and_install()
     assert(!pm::validate_quadlet_policy(bad));
 
     bad = quadlet;
+    bad.contents = "[Container]\nImage=busybox\nVolume=../../home/alice/.ssh:/loot:ro\n"
+                   "Label=com.example.podman-manager.managed=true\n";
+    assert(!pm::validate_quadlet_policy(bad));
+
+    bad = quadlet;
+    bad.contents = "[Container]\nImage=busybox\nMount=type=bind,source=../../host,target=/host\n"
+                   "Label=com.example.podman-manager.managed=true\n";
+    assert(!pm::validate_quadlet_policy(bad));
+
+    bad = quadlet;
     bad.contents = "[Container]\nImage=busybox\nRootfs=/\n"
                    "Label=com.example.podman-manager.managed=true\n";
     assert(!pm::validate_quadlet_policy(bad));
@@ -380,6 +452,10 @@ void test_quadlet_policy_and_install()
     bad.contents = "[Container]\nImage=busybox\nPodmanArgs=--network host\n"
                    "Label=com.example.podman-manager.managed=true\n";
     assert(!pm::validate_quadlet_policy(bad));
+
+    pm::QuadletPolicy podman_args_policy;
+    podman_args_policy.allow_podman_args = true;
+    assert(!pm::validate_quadlet_policy(bad, podman_args_policy));
 
     bad = quadlet;
     bad.contents = "[Container]\nImage=busybox\n"
@@ -411,6 +487,13 @@ void test_quadlet_policy_and_install()
     std::stringstream contents;
     contents << in.rdbuf();
     assert(contents.str() == quadlet.contents);
+
+    layout.max_quadlet_bytes = valid_quadlet_contents().size();
+    pm::QuadletInstaller limited_installer{layout};
+    assert(limited_installer.expected_install(getuid(), quadlet));
+    bad = quadlet;
+    bad.contents.push_back('\n');
+    assert(!limited_installer.expected_install(getuid(), bad));
 }
 
 void test_deployment_orchestrator_installs_and_restarts()
@@ -477,11 +560,161 @@ void test_deployment_rolls_back_when_restart_fails()
     auto deployed = orchestrator.deploy(bundle);
     assert(!deployed);
     assert(deployed.error().message.find("rolled back") != std::string::npos);
+    assert(systemd->calls.size() == 4);
+    assert(systemd->calls[0] == "daemon-reload");
+    assert(systemd->calls[1] == "restart demo.service");
+    assert(systemd->calls[2] == "daemon-reload");
+    assert(systemd->calls[3] == "restart demo.service");
 
     std::ifstream in{layout.quadlet_path(getuid(), "demo.container")};
     std::stringstream contents;
     contents << in.rdbuf();
     assert(contents.str() == old_quadlet.contents);
+}
+
+void test_deployment_rolls_back_when_restart_status_is_unhealthy()
+{
+    TempDir temp;
+
+    pm::QuadletInstallLayout layout;
+    layout.admin_user_root = temp.path();
+    layout.required_owner_uid = getuid();
+
+    pm::QuadletInstaller installer{layout};
+    pm::QuadletFile old_quadlet;
+    old_quadlet.file_name = "demo.container";
+    old_quadlet.contents = valid_quadlet_contents();
+    assert(installer.install_for_user(getuid(), old_quadlet));
+
+    pm::DeploymentBundle bundle;
+    bundle.target_uid = getuid();
+    bundle.service_name = "demo";
+    bundle.quadlet.file_name = "demo.container";
+    bundle.quadlet.contents =
+        "[Unit]\nDescription=New Demo\n\n[Container]\nImage=localhost/demo:new\n"
+        "Label=com.example.podman-manager.managed=true\nReadOnly=true\n";
+
+    auto systemd = std::make_shared<UnhealthyRestartSystemdController>();
+    pm::DeploymentOptions options;
+    options.validate_socket = false;
+    options.load_image_archive = false;
+
+    pm::DeploymentOrchestrator orchestrator{installer, systemd, options};
+    auto deployed = orchestrator.deploy(bundle);
+    assert(!deployed);
+    assert(deployed.error().message.find("unhealthy") != std::string::npos);
+    assert(deployed.error().message.find("rolled back") != std::string::npos);
+    assert(systemd->calls.size() == 4);
+
+    std::ifstream in{layout.quadlet_path(getuid(), "demo.container")};
+    std::stringstream contents;
+    contents << in.rdbuf();
+    assert(contents.str() == old_quadlet.contents);
+}
+
+void test_deployment_rejects_unverified_or_unstaged_archive()
+{
+    TempDir temp;
+    const auto archive = temp.path() / "demo.oci.tar";
+    {
+        std::ofstream out{archive, std::ios::binary};
+        out << "fake-tar";
+    }
+
+    pm::QuadletInstallLayout layout;
+    layout.admin_user_root = temp.path() / "quadlets";
+    layout.required_owner_uid = getuid();
+
+    pm::DeploymentBundle bundle;
+    bundle.target_uid = getuid();
+    bundle.service_name = "demo";
+    bundle.image_archive = pm::ImageArchive{.path = archive, .expected_sha256 = ""};
+    bundle.quadlet.file_name = "demo.container";
+    bundle.quadlet.contents = valid_quadlet_contents();
+
+    auto systemd = std::make_shared<FakeSystemdController>();
+    pm::DeploymentOptions options;
+    options.validate_socket = false;
+
+    pm::DeploymentOrchestrator orchestrator{pm::QuadletInstaller{layout}, systemd, options};
+    auto deployed = orchestrator.deploy(bundle);
+    assert(!deployed);
+    assert(deployed.error().message.find("image_archive_root") != std::string::npos);
+
+    bundle.image_archive->expected_sha256 = "abc";
+    options.image_archive_root = temp.path();
+    pm::DeploymentOrchestrator digest_orchestrator{pm::QuadletInstaller{layout}, systemd, options};
+    deployed = digest_orchestrator.deploy(bundle);
+    assert(!deployed);
+    assert(deployed.error().message.find("expected_sha256") != std::string::npos);
+}
+
+void test_deployment_loads_staged_archive_with_custom_runtime_layout()
+{
+    TempDir temp;
+
+    pm::RuntimeDirectoryLayout runtime_layout;
+    runtime_layout.root = temp.path() / "run-user";
+    const auto socket_path = runtime_layout.podman_socket_for(getuid());
+    UnixListener listener{socket_path};
+
+    const auto staging_root = temp.path() / "staging";
+    std::filesystem::create_directories(staging_root / "images");
+    const auto archive = staging_root / "images" / "demo.oci.tar";
+    {
+        std::ofstream out{archive, std::ios::binary};
+        out << "fake-tar";
+    }
+
+    std::promise<void> ready;
+    std::vector<std::string> requests;
+    std::jthread server{[&](std::stop_token) {
+        ready.set_value();
+        for (int i = 0; i < 2; ++i)
+        {
+            const int client = accept(listener.fd, nullptr, nullptr);
+            assert(client >= 0);
+            auto request = read_http_request(client);
+            requests.push_back(request);
+            if (request.starts_with("GET /_ping "))
+            {
+                send_response(client, 200, "OK", "Libpod-API-Version: 5.0.0\r\n");
+            }
+            else if (request.starts_with("POST /v5.0.0/libpod/images/load "))
+            {
+                send_response(client, 200, R"({"Names":["localhost/demo:latest"]})");
+            }
+            else
+            {
+                send_response(client, 500, request);
+            }
+            close(client);
+        }
+    }};
+    ready.get_future().wait();
+
+    pm::QuadletInstallLayout layout;
+    layout.admin_user_root = temp.path() / "quadlets";
+    layout.required_owner_uid = getuid();
+
+    pm::DeploymentBundle bundle;
+    bundle.target_uid = getuid();
+    bundle.service_name = "demo";
+    bundle.image_archive = pm::ImageArchive{.path = archive, .expected_sha256 = ""};
+    bundle.quadlet.file_name = "demo.container";
+    bundle.quadlet.contents = valid_quadlet_contents();
+
+    auto systemd = std::make_shared<FakeSystemdController>();
+    pm::DeploymentOptions options;
+    options.runtime_layout = runtime_layout;
+    options.image_archive_root = staging_root;
+
+    pm::DeploymentOrchestrator orchestrator{pm::QuadletInstaller{layout}, systemd, options};
+    auto deployed = orchestrator.deploy(bundle);
+    assert(deployed);
+    server.join();
+    assert(requests.size() == 2);
+    assert(requests[1].find("\r\n\r\nfake-tar") != std::string::npos);
 }
 
 void test_podman_client_against_fake_unix_server()
@@ -587,6 +820,9 @@ int main()
     test_quadlet_policy_and_install();
     test_deployment_orchestrator_installs_and_restarts();
     test_deployment_rolls_back_when_restart_fails();
+    test_deployment_rolls_back_when_restart_status_is_unhealthy();
+    test_deployment_rejects_unverified_or_unstaged_archive();
+    test_deployment_loads_staged_archive_with_custom_runtime_layout();
     test_podman_client_against_fake_unix_server();
     test_podman_client_load_image_archive();
 

@@ -5,6 +5,7 @@
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <chrono>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <optional>
@@ -19,14 +20,17 @@ constexpr auto manager_interface = "org.freedesktop.systemd1.Manager";
 constexpr auto unit_interface = "org.freedesktop.systemd1.Unit";
 constexpr auto properties_interface = "org.freedesktop.DBus.Properties";
 
-std::string user_bus_address(uid_t uid)
+std::string user_bus_address(const PodmanTarget& target)
 {
-    return "unix:path=/run/user/" + std::to_string(uid) + "/bus";
+    const auto runtime_dir = target.runtime_dir.empty()
+                                 ? std::filesystem::path{"/run/user"} / std::to_string(target.uid)
+                                 : target.runtime_dir;
+    return "unix:path=" + (runtime_dir / "bus").string();
 }
 
 std::unique_ptr<sdbus::IConnection> user_bus_connection(const PodmanTarget& target)
 {
-    return sdbus::createSessionBusConnectionWithAddress(user_bus_address(target.uid));
+    return sdbus::createSessionBusConnectionWithAddress(user_bus_address(target));
 }
 
 std::unique_ptr<sdbus::IProxy> manager_proxy(std::unique_ptr<sdbus::IConnection>&& connection)
@@ -203,7 +207,7 @@ Result<UnitStatus> SdbusUserSystemdController::status(const PodmanTarget& target
             .withArguments(std::string{unit})
             .storeResultsTo(unit_path);
 
-        auto connection = sdbus::createSessionBusConnectionWithAddress(user_bus_address(target.uid));
+        auto connection = sdbus::createSessionBusConnectionWithAddress(user_bus_address(target));
         auto unit_proxy = sdbus::createProxy(std::move(connection),
                                              sdbus::ServiceName{systemd_service},
                                              unit_path,

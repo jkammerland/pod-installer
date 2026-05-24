@@ -8,7 +8,8 @@ The current deployment path is:
 
 1. pass through an explicit bundle-verification boundary,
 2. validate the supplied bundle and Quadlet policy,
-2. optionally load an image archive through the target user's Podman API socket,
+2. optionally load a staged image archive through the target user's Podman API
+   socket,
 3. snapshot the currently installed Quadlet,
 4. atomically install the supplied `.container` Quadlet under
    `/etc/containers/systemd/users/<uid>/`,
@@ -20,6 +21,16 @@ The MVP assumes the received bundle has already been signed and verified. The
 library contains a `BundleVerifier` TODO boundary so signature, manifest digest,
 signer identity, and artifact-to-manifest binding can be wired in without moving
 the deployment trust boundary.
+
+Image loading through `DeploymentOrchestrator` requires
+`DeploymentOptions::image_archive_root`. Archive paths are opened relative to
+that root with `openat()` and `O_NOFOLLOW`, capped by
+`max_image_archive_bytes`, and streamed to Podman by file descriptor. The
+low-level `PodmanClient::load_image_archive(path)` helper remains available for
+trusted direct callers.
+`ImageArchive::expected_sha256` is reserved for the future manifest verifier;
+non-empty values are rejected so callers do not mistake it for active digest
+verification.
 
 ## Build
 
@@ -40,7 +51,9 @@ the listener so a `uWebSockets` adapter can replace it later.
 - `PodmanClient`: HTTP over AF_UNIX using libcurl, with helpers for `_ping`,
   info, list, create, start, stop, remove, and image archive load.
 - `DeploymentOrchestrator`: deploys a supplied image archive and supplied
-  `.container` Quadlet for a target uid.
+  `.container` Quadlet for a target uid. Deployments hold a per-user/unit lock,
+  validate final unit status, and perform systemd-aware Quadlet rollback after
+  reload/restart failures.
 - `QuadletInstaller`: validates policy and atomically installs supplied Quadlet
   text into the configured admin-controlled rootless search path. It snapshots
   existing files so deployments can roll back after post-install failures.
@@ -112,6 +125,14 @@ directives, `PodmanArgs=`, privileged containers, host networking, host
 PID/IPC/user namespaces, devices, host path bind mounts, `Rootfs=`, missing
 `Image=`, and missing or duplicate managed labels.
 
-The example service only reads staged Quadlet files under `--staging-root`.
-It opens staged files with `O_NOFOLLOW`, requires regular files, and caps
-Quadlet size at 1 MiB.
+The example service only reads staged Quadlet and image archive files under
+`--staging-root`. It opens staged paths by walking from the staging root with
+`openat()` and `O_NOFOLLOW`, requires regular files, caps Quadlet size at 1 MiB,
+and passes image archive paths to the deployment library as staging-relative
+paths.
+
+Image loading is not fully transactional in this MVP: if Podman imports an
+archive and a later Quadlet reload/restart fails, the Quadlet is rolled back but
+the imported image may remain in the target user's rootless image store. Treat
+image cleanup as a retention/GC policy until image response parsing and
+remove-on-failure are added.

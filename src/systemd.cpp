@@ -34,7 +34,7 @@ bool safe_systemd_value(std::string_view value)
 
 bool safe_systemd_unit(std::string_view unit)
 {
-    if (unit.empty() || unit.size() > 255)
+    if (unit.empty() || unit.size() > 255 || unit.starts_with('-'))
     {
         return false;
     }
@@ -47,6 +47,26 @@ bool safe_systemd_unit(std::string_view unit)
     }
     return unit.ends_with(".service") || unit.ends_with(".socket") || unit.ends_with(".timer") ||
            unit.ends_with(".target");
+}
+
+Result<int> wait_for_child(pid_t pid)
+{
+    int status{};
+    for (;;)
+    {
+        if (waitpid(pid, &status, 0) >= 0)
+        {
+            return status;
+        }
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        return std::unexpected(make_error(ErrorKind::systemd,
+                                          "waitpid failed for systemctl: " + std::string{std::strerror(errno)},
+                                          0,
+                                          errno));
+    }
 }
 
 Result<void> run_process(const std::vector<std::string>& args)
@@ -75,19 +95,16 @@ Result<void> run_process(const std::vector<std::string>& args)
                                           spawn_rc));
     }
 
-    int status{};
-    if (waitpid(pid, &status, 0) < 0)
+    auto status = wait_for_child(pid);
+    if (!status)
     {
-        return std::unexpected(make_error(ErrorKind::systemd,
-                                          "waitpid failed for systemctl: " + std::string{std::strerror(errno)},
-                                          0,
-                                          errno));
+        return std::unexpected(status.error());
     }
 
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    if (!WIFEXITED(*status) || WEXITSTATUS(*status) != 0)
     {
         return std::unexpected(make_error(ErrorKind::systemd,
-                                          "systemctl exited with status " + std::to_string(status)));
+                                          "systemctl exited with status " + std::to_string(*status)));
     }
 
     return {};
@@ -165,18 +182,15 @@ Result<std::string> run_process_capture(const std::vector<std::string>& args)
     }
     close(pipe_fds[0]);
 
-    int status{};
-    if (waitpid(pid, &status, 0) < 0)
+    auto status = wait_for_child(pid);
+    if (!status)
     {
-        return std::unexpected(make_error(ErrorKind::systemd,
-                                          "waitpid failed for systemctl: " + std::string{std::strerror(errno)},
-                                          0,
-                                          errno));
+        return std::unexpected(status.error());
     }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    if (!WIFEXITED(*status) || WEXITSTATUS(*status) != 0)
     {
         return std::unexpected(make_error(ErrorKind::systemd,
-                                          "systemctl exited with status " + std::to_string(status) +
+                                          "systemctl exited with status " + std::to_string(*status) +
                                               " output: " + output));
     }
     return output;

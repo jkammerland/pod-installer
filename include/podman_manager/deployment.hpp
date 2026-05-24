@@ -6,6 +6,7 @@
 #include "podman_manager/socket_validation.hpp"
 #include "podman_manager/systemd.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -32,6 +33,8 @@ struct DeploymentBundle
 struct DeploymentOptions
 {
     RuntimeDirectoryLayout runtime_layout{};
+    std::optional<std::filesystem::path> image_archive_root;
+    uintmax_t max_image_archive_bytes{8ULL * 1024ULL * 1024ULL * 1024ULL};
     std::string api_version{"5.0.0"};
     bool validate_socket{true};
     bool load_image_archive{true};

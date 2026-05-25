@@ -158,3 +158,37 @@ archive and a later Quadlet reload/restart fails, the Quadlet is rolled back but
 the imported image may remain in the target user's rootless image store. Treat
 image cleanup as a retention/GC policy until image response parsing and
 remove-on-failure are added.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    client[Deployment client] -->|POST bundle request| api[Example orchestration service]
+
+    subgraph root["root-owned process"]
+        api --> verifier[BundleVerifier boundary]
+        verifier --> deploy[DeploymentOrchestrator]
+        deploy --> policy[Quadlet policy validation]
+        deploy --> installer[QuadletInstaller]
+        deploy --> podman[PodmanClient]
+        deploy --> systemd[UserSystemdController]
+        deploy --> lock[per-user/unit deployment lock]
+    end
+
+    subgraph staging["admin-controlled staging root"]
+        manifest[manifest and signature TODO]
+        image[image.oci.tar]
+        quadlet[demo.container]
+    end
+
+    verifier -. assumes pre-verified MVP .-> manifest
+    policy --> quadlet
+    podman -->|HTTP over Unix socket| socket["/run/user/<uid>/podman/podman.sock"]
+    socket --> userpodman["target user's rootless Podman service"]
+    userpodman --> images["target user's image store"]
+    installer --> quadletdir["/etc/containers/systemd/users/<uid>/"]
+    systemd -->|reload/restart/status| usermgr["target user's systemd manager"]
+    usermgr --> generated["generated .service from Quadlet"]
+    generated --> container["rootless container workload"]
+    images --> container
+```

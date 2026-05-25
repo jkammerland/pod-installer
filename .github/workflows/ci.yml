@@ -10,10 +10,14 @@ name: CI
 permissions:
   contents: read
 
+env:
+  LLVM_VERSION: '21'
+  LLVM_PREFIX: /usr/lib/llvm-21
+
 jobs:
   format:
     name: clang-format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out sources
         uses: actions/checkout@v4
@@ -21,16 +25,22 @@ jobs:
       - name: Install formatter
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format
+          sudo apt-get install -y gnupg lsb-release wget
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          . /etc/os-release
+          echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-${LLVM_VERSION} main" |
+            sudo tee /etc/apt/sources.list.d/llvm-toolchain.list
+          sudo apt-get update
+          sudo apt-get install -y clang-format-${LLVM_VERSION}
 
       - name: Check formatting
         run: |
           mapfile -t files < <(git ls-files '*.cpp' '*.hpp' '*.h' '*.cc' '*.cxx')
-          clang-format --dry-run --Werror "${files[@]}"
+          clang-format-${LLVM_VERSION} --dry-run --Werror "${files[@]}"
 
   build-test:
     name: ${{ matrix.preset }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -47,24 +57,37 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang \
             g++ \
             git \
-            libclang-dev \
+            gnupg \
             libcurl4-openssl-dev \
             libffi-dev \
             libxml2-dev \
             libzstd-dev \
-            llvm-dev \
+            lsb-release \
             ninja-build \
             pkg-config \
             python3-pip \
+            wget \
             zlib1g-dev
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          . /etc/os-release
+          echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-${LLVM_VERSION} main" |
+            sudo tee /etc/apt/sources.list.d/llvm-toolchain.list
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang-${LLVM_VERSION} \
+            libclang-${LLVM_VERSION}-dev \
+            llvm-${LLVM_VERSION}-dev
           python3 -m pip install --user --break-system-packages --upgrade cmake
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Configure
-        run: cmake --preset=${{ matrix.preset }}
+        run: >
+          cmake --preset=${{ matrix.preset }}
+          -DCMAKE_PREFIX_PATH=${LLVM_PREFIX}
+          -DLLVM_DIR=${LLVM_PREFIX}/lib/cmake/llvm
+          -DClang_DIR=${LLVM_PREFIX}/lib/cmake/clang
 
       - name: Build
         run: cmake --build --preset=${{ matrix.preset }}
@@ -74,7 +97,7 @@ jobs:
 
   tidy:
     name: clang-tidy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out sources
         uses: actions/checkout@v4
@@ -83,35 +106,47 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang \
-            clang-tidy \
             g++ \
             git \
-            libclang-dev \
+            gnupg \
             libcurl4-openssl-dev \
             libffi-dev \
             libxml2-dev \
             libzstd-dev \
-            llvm-dev \
+            lsb-release \
             ninja-build \
             pkg-config \
             python3-pip \
+            wget \
             zlib1g-dev
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          . /etc/os-release
+          echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-${LLVM_VERSION} main" |
+            sudo tee /etc/apt/sources.list.d/llvm-toolchain.list
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang-${LLVM_VERSION} \
+            clang-tidy-${LLVM_VERSION} \
+            libclang-${LLVM_VERSION}-dev \
+            llvm-${LLVM_VERSION}-dev
           python3 -m pip install --user --break-system-packages --upgrade cmake
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Configure clang compile database
         run: >
           cmake -S . -B build/tidy -G Ninja
-          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_CXX_COMPILER=clang++-${LLVM_VERSION}
           -DCMAKE_CXX_SCAN_FOR_MODULES=OFF
+          -DCMAKE_PREFIX_PATH=${LLVM_PREFIX}
+          -DLLVM_DIR=${LLVM_PREFIX}/lib/cmake/llvm
+          -DClang_DIR=${LLVM_PREFIX}/lib/cmake/clang
 
       - name: Build generated test wrapper
         run: cmake --build build/tidy --target podman_manager_tests
 
       - name: Run clang-tidy
         run: |
-          clang-tidy -p build/tidy --quiet \
+          clang-tidy-${LLVM_VERSION} -p build/tidy --quiet \
             src/*.cpp \
             examples/*.cpp \
             build/tidy/gentest/podman_manager_tests/tu_0000_podman_manager_tests.gentest.cpp
